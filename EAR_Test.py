@@ -1,105 +1,75 @@
 import cv2
 import mediapipe as mp
-import math
+import numpy as np
 
-# 두 점 사이의 유클리드 거리를 계산하는 함수
-def calculate_distance(p1, p2):
-    return math.dist(p1, p2)
-
-# EAR(Eye Aspect Ratio)을 계산하는 함수
-def calculate_ear(eye_landmarks):
-    # 세로 거리 (눈의 위아래 두 쌍의 점 사이 거리)
-    vertical_1 = calculate_distance(eye_landmarks[1], eye_landmarks[5])
-    vertical_2 = calculate_distance(eye_landmarks[2], eye_landmarks[4])
-    
-    # 가로 거리 (눈의 양 끝점 사이 거리)
-    horizontal = calculate_distance(eye_landmarks[0], eye_landmarks[3])
-    
-    # EAR 공식 적용
-    ear = (vertical_1 + vertical_2) / (2.0 * horizontal)
-    return ear
-
-# MediaPipe Face Mesh 초기화
+.# MediaPipe 초기화
 mp_face_mesh = mp.solutions.face_mesh
 face_mesh = mp_face_mesh.FaceMesh(
-    max_num_faces=1, 
-    refine_landmarks=True, 
-    min_detection_confidence=0.5, 
-    min_tracking_confidence=0.5
-)
+    max_num_faces=1,
+    refine_landmarks=True,
+    min_detection_confidence=0.5,
+    min_tracking_confidence=0.5)
 
-# 눈 랜드마크 인덱스 (왼쪽/오른쪽 눈을 구성하는 6개의 점)
-# 순서: 양끝점 시작(p1) -> 위쪽(p2, p3) -> 반대끝(p4) -> 아래쪽(p5, p6)
-RIGHT_EYE_INDICES = [33, 160, 158, 133, 153, 144]
-LEFT_EYE_INDICES = [362, 385, 387, 263, 373, 380]
+.# 눈 좌표 인덱스 (MediaPipe FaceMesh 기준)
+LEFT_EYE = [362, 385, 387, 263, 373, 380]
+RIGHT_EYE = [33, 160, 158, 133, 153, 144]
 
-# 눈 감김 판별을 위한 기준값 (환경이나 사람에 따라 조정 필요)
-EAR_THRESHOLD = 0.21
+def calculate_ear(landmarks, eye_indices, img_w, img_h):
+    # 좌표 추출
+    coords = []
+    for i in eye_indices:
+        lm = landmarks[i]
+        coords.append(np.array([lm.x * img_w, lm.y * img_h]))
+    
+   . # EAR 공식: (||p2-p6|| + ||p3-p5||) / (2 * ||p1-p4||)
+    v1 = np.linalg.norm(coords[1] - coords[5])
+    v2 = np.linalg.norm(coords[2] - coords[4])
+    h  = np.linalg.norm(coords[0] - coords[3])
+    ear = (v1 + v2) / (2.0 * h)
+    return ear
 
-# 웹캠 연결
+.# 젯슨 나노 카메라 설정 (CSI 카메라 사용 시 gstreamer 설정 필요, USB면 0)
 cap = cv2.VideoCapture(0)
 
-while cap.isOpened():
-    ret, frame = cap.read()
-    if not ret:
-        print("웹캠을 찾을 수 없습니다.")
-        break
+.# 눈 감음 판단 기준값 (테스트 후 조정 필요)
+EAR_THRESHOLD = 0.22 
 
-    # 좌우 반전 (거울 모드) 및 BGR을 RGB로 변환 (MediaPipe는 RGB를 사용)
-    frame = cv2.flip(frame, 1)
-    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    
-    # 얼굴 랜드마크 감지
-    results = face_mesh.process(rgb_frame)
-    
-    # 화면의 크기 가져오기
-    ih, iw, _ = frame.shape
-    
+while cap.isOpened():
+    success, image = cap.read()
+    if not success: break
+
+    # 성능을 위해 이미지 쓰기 불가능 설정 후 처리
+    image.flags.writeable = False
+    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    results = face_mesh.process(image)
+
+    image.flags.writeable = True
+    image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+    h, w, _ = image.shape
+
     if results.multi_face_landmarks:
         for face_landmarks in results.multi_face_landmarks:
+            left_ear = calculate_ear(face_landmarks.landmark, LEFT_EYE, w, h)
+            right_ear = calculate_ear(face_landmarks.landmark, RIGHT_EYE, w, h)
             
-            # 오른쪽 눈의 픽셀 좌표 추출
-            right_eye_points = []
-            for index in RIGHT_EYE_INDICES:
-                point = face_landmarks.landmark[index]
-                right_eye_points.append((int(point.x * iw), int(point.y * ih)))
-                
-            # 왼쪽 눈의 픽셀 좌표 추출
-            left_eye_points = []
-            for index in LEFT_EYE_INDICES:
-                point = face_landmarks.landmark[index]
-                left_eye_points.append((int(point.x * iw), int(point.y * ih)))
-            
-            # 각 눈의 EAR 계산
-            right_ear = calculate_ear(right_eye_points)
-            left_ear = calculate_ear(left_eye_points)
-            
-            # 두 눈의 EAR 평균값 계산
-            avg_ear = (right_ear + left_ear) / 2.0
-            
-            # 화면에 랜드마크 점 그리기 (선택 사항)
-            for point in right_eye_points + left_eye_points:
-                cv2.circle(frame, point, 2, (0, 255, 0), -1)
+            avg_ear = (left_ear + right_ear) / 2.0
 
-            # EAR 값에 따라 상태 판별
+            # 눈 개폐 판단
+            status = "Eyes Open"
+            color = (0, 255, 0)
             if avg_ear < EAR_THRESHOLD:
-                status = "CLOSED"
-                color = (0, 0, 255) # 빨간색
-            else:
-                status = "OPEN"
-                color = (255, 0, 0) # 파란색
-                
-            # 화면에 텍스트 출력
-            cv2.putText(frame, f"Eye Status: {status}", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
-            cv2.putText(frame, f"EAR: {avg_ear:.2f}", (30, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+                status = "Eyes Closed"
+                color = (0, 0, 255)
 
-    # 결과 화면 출력
-    cv2.imshow('Eye Blink Detection', frame)
+            # 화면 표시
+            cv2.putText(image, f"EAR: {avg_ear:.2f}", (30, 30), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
+            cv2.putText(image, status, (30, 70), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
 
-    # 'q' 키를 누르면 종료
-    if cv2.waitKey(1) & 0xFF == ord('q'):
+    cv2.imshow('Jetson Nano - Eye Tracking', image)
+    if cv2.waitKey(5) & 0xFF == 27: # ESC로 종료
         break
 
-# 자원 해제
 cap.release()
 cv2.destroyAllWindows()
